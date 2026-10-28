@@ -811,6 +811,9 @@ export function heartbeatService(
     getAgent,
     resolveSessionBeforeForWakeup,
     getRun,
+    getRunCleanupState,
+    getRunExecutionWait,
+    getRunWorkspaceSettlement,
     getRunStatus,
     ensureRuntimeState,
     getTaskSession,
@@ -823,6 +826,7 @@ export function heartbeatService(
     hasResolvablePriorSessionWorkspaceForWake,
     getRunReadAccess,
     getRunLogAccess,
+    getRunWorkspaceAccess,
     listRuns,
     getRuntimeStateWithSessions,
     listTaskSessions,
@@ -830,6 +834,8 @@ export function heartbeatService(
     listEvents,
     getRetryExhaustedReason,
     getRunIssueSummary,
+    getRunIssueControl,
+    getActiveRunIssueControlForAgent,
     getActiveRunForAgent,
     getActiveRunIssueSummaryForAgent,
   } = createHeartbeatRunState(db);
@@ -1014,6 +1020,7 @@ export function heartbeatService(
     environmentRuntime,
     scheduleNativeSessionResumeDispatch,
     getRun,
+    getRunWorkspaceSettlement,
     executeRun,
     activeRunExecutionPromises,
     cancelHeartbeatNativeRun,
@@ -1304,6 +1311,16 @@ export function heartbeatService(
     return heartbeatQueue.dispatchPendingNativeStatusWakeups(...args);
   }
 
+  function resumeQueuedRunsAfterDrain() {
+    const promise = heartbeatQueue.resumeQueuedRunsAfterDrain();
+    activeWakeupPromises.add(promise);
+    void promise.then(
+      () => { activeWakeupPromises.delete(promise); },
+      () => { activeWakeupPromises.delete(promise); },
+    );
+    return promise;
+  }
+
   const runLifecycle = createHeartbeatLifecycle(db, {
     issuesSvc,
     recovery,
@@ -1386,6 +1403,8 @@ export function heartbeatService(
 
   const runControl = createHeartbeatRunControl(db, {
     getRun,
+    getRunCleanupState,
+    getRunExecutionWait,
     options,
     envOrchestrator,
     activeRunExecutions,
@@ -2313,7 +2332,7 @@ export function heartbeatService(
         interactionId: readNonEmptyString(context.interactionId),
         issueId,
         messageIds:
-          run.retryOfRunId || context.retryOfRunId
+          (run.retryOfRunId || context.retryOfRunId) && !isFailedChatRunRetry
             ? []
             : queuedCommentIdsFromRunContext(context).length
               ? queuedCommentIdsFromRunContext(context)
@@ -2371,7 +2390,7 @@ export function heartbeatService(
         !boundSourceWorkspace && !taskWorkspaceIntentRow?.intent && !issueContext?.projectWorkspaceId
           ? taskProjectContext : null
       );
-      const parsedProjectExecutionWorkspacePolicy = workspacePolicyContext && !boundSourceWorkspace
+      const parsedProjectExecutionWorkspacePolicy = workspacePolicyContext?.hasWorkspace
         ? await effectiveProjectWorkspacePolicy(db, agent.companyId, workspacePolicyContext.executionWorkspacePolicy, workspacePolicyContext.hasGitSource)
         : parseProjectExecutionWorkspacePolicy(workspacePolicyContext?.executionWorkspacePolicy);
       const projectExecutionWorkspacePolicy =
@@ -2704,6 +2723,7 @@ export function heartbeatService(
           mergedConfig,
           configSnapshot,
           secretManifest,
+          managedAiCredentialIdentity: managedAiRuntime?.identity,
         },
         reuse: {
           requestedShouldReuseExisting,
@@ -3987,6 +4007,7 @@ export function heartbeatService(
 
     getRunReadAccess,
     getRunLogAccess,
+    getRunWorkspaceAccess,
 
     getRuntimeState: getRuntimeStateWithSessions,
 
@@ -4007,7 +4028,7 @@ export function heartbeatService(
             logStore: string | null;
             logRef: string | null;
           },
-      opts?: { offset?: number; limitBytes?: number },
+      opts?: { offset?: number; limitBytes?: number; alignStartToRecord?: boolean; signal?: AbortSignal },
     ) => {
       const run =
         typeof runOrLookup === "string"
@@ -4084,6 +4105,8 @@ export function heartbeatService(
 
     resumeQueuedRuns,
 
+    resumeQueuedRunsAfterDrain,
+
     resumeQueuedRunsForAgent: async (companyId: string, agentId: string) => {
       const agent = await getAgent(agentId);
       if (!agent || agent.companyId !== companyId) return [];
@@ -4148,6 +4171,10 @@ export function heartbeatService(
     cancelBudgetScopeWork,
 
     getRunIssueSummary,
+
+    getRunIssueControl,
+
+    getActiveRunIssueControlForAgent,
 
     getActiveRunForAgent,
 
