@@ -16,6 +16,13 @@ import {
 import { createAgentSchema } from "./agent.js";
 
 describe("issue validators", () => {
+  it.each(["BASH_ENV", "ZDOTDIR", "GH_CONFIG_DIR", "PAPERCLIP_GITHUB_LAUNCHER_DIR"])("rejects task-owned managed shell selector %s", key => {
+    for (const name of [key, key.toLowerCase()]) {
+      const overrides = {adapterConfig:{env:{[name]:"/workspace/startup"}}};
+      expect(createIssueSchema.safeParse({title:"Task",assigneeAdapterOverrides:overrides}).success).toBe(false);
+      expect(updateIssueSchema.safeParse({assigneeAdapterOverrides:overrides}).success).toBe(false);
+    }
+  });
   it("retains an optional nonnegative integer version for prepared-task promotion", () => {
     expect(updateIssueSchema.parse({ status: "todo", expectedStatusVersion: 0 }).expectedStatusVersion).toBe(0);
     expect(updateIssueSchema.parse({}).expectedStatusVersion).toBeUndefined();
@@ -707,6 +714,18 @@ describe("persisted canonical question initial text", () => {
       const initialText = "a".repeat(codePoints - 1) + "😀";
       expect(Buffer.byteLength(JSON.stringify(input({ initialText })))).toBeLessThan(196 * 1024);
       expect(paperclipQuestionSetPayloadSchema.safeParse(input({ initialText })).success).toBe(codePoints === 100_000);
+    }
+  });
+  it("bounds question text by the string length the Runner parser enforces", () => {
+    const within = paperclipQuestionSetPayloadSchema.safeParse(input({ prompt: "😀".repeat(2000) }));
+    expect(within.success).toBe(true);
+    for (const payload of [
+      input({ prompt: "😀".repeat(2000) + "x" }),
+      input({ id: "😀".repeat(81) }),
+      { ...input({}), title: "😀".repeat(501) },
+      { ...input({}), submitLabel: "😀".repeat(101) },
+    ]) {
+      expect(paperclipQuestionSetPayloadSchema.safeParse(payload).success).toBe(false);
     }
   });
   it("rejects non-text modes and unbounded or nonstring defaults", () => {

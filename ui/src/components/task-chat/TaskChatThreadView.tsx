@@ -1,6 +1,7 @@
 import { TaskBrowserActivity } from "../task-side-panel/TaskBrowserActivity";
 import { TaskChatProjectCreatedCard } from "./TaskChatProjectCreatedCard";
 import { TaskChatSkillCreatedCard } from "./TaskChatSkillCreatedCard";
+import { TaskChatTaskCreatedCard } from "./TaskChatTaskCreatedCard";
 import { useMemo, type ReactNode } from "react";
 import type { IssueAttachment } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
@@ -18,10 +19,11 @@ import { TaskChatMarker } from "./TaskChatMarker";
 import { TaskChatStatusPill } from "./TaskChatStatusPill";
 import { TaskChatToolCard } from "./TaskChatToolCard";
 import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
+import { TaskChatSubagentTree } from "./TaskChatSubagentCard";
 import { TaskChatRunnerActivityGroup } from "./TaskChatRunnerActivityGroup";
 import { TaskChatActivityPhase } from "./TaskChatActivityPhase";
 import { TaskChatThinking } from "./TaskChatThinking";
-import { TaskMessageScroller } from "./TaskMessageScroller";
+import { TaskMessageScroller, type ScrollingHistory } from "./TaskMessageScroller";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
 import { TaskChatProtocolActivityRow } from "./TaskChatProtocolActivityRow";
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
@@ -33,6 +35,7 @@ import { CoordinatorChatPendingQuestion } from "@/components/coordinator/Coordin
 const EMPTY_ATTACHMENTS: IssueAttachment[] = [];
 
 interface TaskChatThreadViewProps {
+  scrollingHistory?: ScrollingHistory;
   items: TaskChatItem[];
   /**
    * Content rendered above the first message INSIDE the scroll viewport (the
@@ -110,6 +113,7 @@ function renderItem(
     case "browser": return <TaskBrowserActivity browser={item.browser} label={item.label} onOpen={onOpenBrowser} />;
     case "project_created": return <TaskChatProjectCreatedCard item={item} />;
     case "skill_created": return <TaskChatSkillCreatedCard item={item} onOpen={onOpenSkill} />;
+    case "task_created": return <TaskChatTaskCreatedCard item={item} />;
     case "message": {
       // Compute the actions once: the bubble renders them for a runless reply
       // (footer = actions + timestamp), while an attached turn hands them to
@@ -233,6 +237,8 @@ function renderItem(
       );
     case "brief":
       return renderBrief ? renderBrief() : null;
+    case "subagent_group":
+      return <TaskChatSubagentTree subagents={item.subagents} />;
     case "turn":
       return (
         <TaskChatTurn
@@ -303,6 +309,7 @@ export function taskChatItemSpacingClass(
  * TaskChatItem[] onto the primitives inside the auto-follow scroller.
  */
 export function TaskChatThreadView({
+  scrollingHistory,
   items,
   header,
   onApprovalDecision,
@@ -433,7 +440,7 @@ export function TaskChatThreadView({
   if (!scroll) return body;
 
   return (
-    <TaskMessageScroller contentKey={contentKey ?? taskChatContentKey(items)}>
+    <TaskMessageScroller contentKey={contentKey ?? taskChatContentKey(items)} scrollingHistory={scrollingHistory}>
       {body}
     </TaskMessageScroller>
   );
