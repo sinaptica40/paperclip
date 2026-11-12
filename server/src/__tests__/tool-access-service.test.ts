@@ -68,6 +68,7 @@ import {
   GOOGLE_WORKSPACE_DEFAULT_SELECTION,
   getAvailableConnectionMethod,
   getConnectableAppDefinition,
+  createToolConnectionSchema,
   type CreateToolConnection,
   type GoogleWorkspaceConnectorProfileId,
 } from "@paperclipai/shared";
@@ -3361,6 +3362,42 @@ describeEmbeddedPostgres("tool access service", () => {
       .where(eq(toolConnections.companyId, company.id))).toEqual([]);
     expect(await db.select().from(companySecrets)
       .where(eq(companySecrets.companyId, company.id))).toEqual([]);
+  });
+
+  it.each([
+    { name: "channel purpose", input: { connectionPurpose: "channel" as const, transport: "local_stdio" as const } },
+    { name: "chat transport", input: { transport: "chat_sdk" as const } },
+    { name: "voice transport", input: { transport: "voice" as const } },
+  ])("rejects a $name before it writes any row", async ({ input }) => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+
+    await expect(service.createConnection(company.id, connectionInput({
+      name: "Not a tool",
+      config: { templateId: "paperclip.echo-calculator-time" },
+      ...input,
+    }))).rejects.toMatchObject({ status: 422 });
+
+    expect(await db.select().from(toolConnections)
+      .where(eq(toolConnections.companyId, company.id))).toEqual([]);
+    expect(await db.select().from(toolApplications)
+      .where(eq(toolApplications.companyId, company.id))).toEqual([]);
+  });
+
+  it("stores config as transportConfig when the request leaves transportConfig out", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const body = createToolConnectionSchema.parse({
+      name: "Local echo config only",
+      transport: "local_stdio",
+      config: { templateId: "paperclip.echo-calculator-time" },
+    });
+
+    const connection = await service.createConnection(company.id, body);
+
+    const [stored] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+    expect(stored?.config).toMatchObject({ templateId: "paperclip.echo-calculator-time" });
+    expect(stored?.transportConfig).toEqual(stored?.config);
   });
 
   it("registers an approved local stdio template and exposes its runtime slot", async () => {
@@ -16586,6 +16623,76 @@ describeEmbeddedPostgres("tool access service", () => {
     });
     await expect(db.select().from(toolApplications)).resolves.toHaveLength(0);
     await expect(db.select().from(toolConnections)).resolves.toHaveLength(0);
+  });
+
+  it("asks for a key when a pasted link answers 401 without a challenge header", async () => {
+    const company = await createCompany(db);
+    const app = createRouteApp(db);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 401,
+      headers: { get: () => null },
+      text: async () => "",
+      json: async () => ({}),
+    } as unknown as Response);
+
+    const res = await request(app)
+      .post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({
+        link: "https://key.example.test/mcp",
+        name: "Key app",
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({
+      details: expect.objectContaining({ code: "oauth_challenge" }),
+    });
+  });
+
+  it("keeps the raw rejection when a pasted link's own URL token is refused", async () => {
+    const company = await createCompany(db);
+    const app = createRouteApp(db);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 401,
+      headers: { get: () => null },
+      text: async () => "",
+      json: async () => ({}),
+    } as unknown as Response);
+
+    const res = await request(app)
+      .post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({
+        link: "https://key.example.test/mcp?token=expired-url-token",
+        name: "URL token app",
+      });
+
+    expect(res.body?.details?.code).not.toBe("oauth_challenge");
+    expect(res.status).not.toBe(422);
+  });
+
+  it("still asks for a key when a pasted link carries only plain settings", async () => {
+    const company = await createCompany(db);
+    const app = createRouteApp(db);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 401,
+      headers: { get: () => null },
+      text: async () => "",
+      json: async () => ({}),
+    } as unknown as Response);
+
+    const res = await request(app)
+      .post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({
+        link: "https://key.example.test/mcp?region=us",
+        name: "Regional key app",
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({
+      details: expect.objectContaining({ code: "oauth_challenge" }),
+    });
   });
 
   it.each(["catalog", "catalog/refresh", "health-check"])(
