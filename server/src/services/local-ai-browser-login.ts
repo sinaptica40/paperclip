@@ -1,11 +1,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { open } from "node:fs/promises";
-import { constants } from "node:fs";
+import { constants, existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { runSetupTokenLogin } from "@paperclipai/adapter-claude-local/server";
 import { runDeviceLogin } from "@paperclipai/adapter-codex-local/server";
 import { ensureCommandResolvable, resolveCommandForLogs } from "@paperclipai/adapter-utils/server-utils";
 import { resolveCodexCommand, startAntigravityBrowserLogin } from "../vendor/paperclip-runner/index.js";
+import { createConPtyOutputNormalizer } from "./conpty-output.js";
 
 export type LocalBrowserLoginState = {
   authorizationUrl?: string;
@@ -46,13 +47,61 @@ _, status = os.waitpid(pid, 0)
 sys.exit(os.waitstatus_to_exitcode(status))
 `;
 
+type LoginTerminal = { write(input: string): void; kill(): void };
+
+/** Find an executable the way Windows does, because node-pty needs a full path. */
+function resolveWindowsExecutable(command: string, env: NodeJS.ProcessEnv): string | null {
+  const extensions = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
+  const hasExtension = extensions.some((extension) => command.toLowerCase().endsWith(extension.toLowerCase()));
+  const directories = path.isAbsolute(command) ? [""] : (env.PATH ?? env.Path ?? "").split(path.delimiter).filter(Boolean);
+  for (const directory of directories) {
+    const base = directory ? path.join(directory, command) : command;
+    for (const candidate of hasExtension ? [base] : extensions.map((extension) => base + extension)) {
+      try { if (existsSync(candidate) && statSync(candidate).isFile()) return candidate; } catch { /* keep looking */ }
+    }
+  }
+  return null;
+}
+
+/**
+ * Windows has no Python pty module, so the provider CLI runs in a ConPTY through
+ * node-pty. It is loaded only here, so other platforms never need the package.
+ */
+async function startWindowsTerminal(
+  executable: string, args: string[], env: NodeJS.ProcessEnv,
+  onData: (chunk: string) => void, attach: (terminal: LoginTerminal) => void,
+): Promise<{ exitCode: number | null }> {
+  const file = resolveWindowsExecutable(executable, env);
+  if (!file) throw new Error("Browser login executable not found");
+  const pty = await import("node-pty");
+  // A .cmd or .bat launcher must run through the command interpreter.
+  const script = /\.(cmd|bat)$/i.test(file);
+  const [command, commandArgs] = script ? [env.ComSpec ?? "cmd.exe", ["/d", "/c", file, ...args]] : [file, args];
+  // A wide terminal keeps the long sign-in URL on one row.
+  const terminal = pty.spawn(command, commandArgs, {
+    name: "xterm-256color", cols: 500, rows: 50, cwd: process.cwd(),
+    env: Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string")),
+  });
+  let exited = false;
+  let killed = false;
+  // Stop and dispose both ask for a kill. Closing a pseudoconsole twice can crash
+  // the whole server process, so only the first request reaches node-pty.
+  attach({
+    write: (input) => { if (!exited && !killed) terminal.write(input); },
+    kill: () => { if (exited || killed) return; killed = true; try { terminal.kill(); } catch { /* already gone */ } },
+  });
+  const normalize = createConPtyOutputNormalizer();
+  terminal.onData((chunk) => onData(normalize(chunk)));
+  return new Promise((resolve) => terminal.onExit(({ exitCode }) => { exited = true; resolve({ exitCode }); }));
+}
+
 /** Run the same browser-code login used by sandbox connections on the local host. */
 export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "google", home: string): LocalBrowserLoginState {
   if (provider === "google") return startAntigravityBrowserLogin(home);
   const controller = new AbortController();
   const state: LocalBrowserLoginState = { abort: () => controller.abort() };
   const args = provider === "anthropic" ? ["setup-token"] : ["login", "--device-auth"];
-  let child: ChildProcessWithoutNullStreams | null = null;
+  let terminal: LoginTerminal | null = null;
   const driver = {
     async start(_command: string, onData: (chunk: string) => void): Promise<{ exitCode: number | null }> {
       let executable = "claude";
@@ -81,8 +130,17 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "googl
         CODEX_HOME: provider === "openai" ? home : process.env.CODEX_HOME,
         BROWSER: "true",
       };
+      if (process.platform === "win32") {
+        try {
+          return await startWindowsTerminal(executable, args, env, onData, (attached) => { terminal = attached; });
+        } catch {
+          state.error = "Browser sign-in could not start a Windows terminal. Make sure the CLI is installed and on Paperclip's PATH, then start sign-in again.";
+          throw new Error("Browser login terminal unavailable");
+        }
+      }
       return new Promise((resolve, reject) => {
-        child = spawn("python3", ["-u", "-c", PYTHON_PTY_BRIDGE, executable, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
+        const child: ChildProcessWithoutNullStreams = spawn("python3", ["-u", "-c", PYTHON_PTY_BRIDGE, executable, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
+        terminal = { write: (input) => { child.stdin.write(input); }, kill: () => { child.kill("SIGTERM"); } };
         child.stdout.on("data", (bytes: Buffer) => onData(bytes.toString("utf8")));
         // Provider output may contain secrets. Never log or retain stderr.
         child.stderr.resume();
@@ -93,9 +151,9 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "googl
         child.once("close", (exitCode) => resolve({ exitCode }));
       });
     },
-    write(input: string) { child?.stdin.write(input); },
-    stop() { child?.kill("SIGTERM"); },
-    async dispose() { child?.kill("SIGTERM"); },
+    write(input: string) { terminal?.write(input); },
+    stop() { terminal?.kill(); },
+    async dispose() { terminal?.kill(); },
     async readFile(file: string) { const { readLocalAiCredentialFile } = await import("./local-ai-credential-file.js"); return Buffer.from(await readLocalAiCredentialFile(file)); },
   };
   if (provider === "anthropic") {
