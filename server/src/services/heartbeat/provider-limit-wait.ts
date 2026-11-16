@@ -2,7 +2,7 @@ import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
 import { AI_CONNECTION_POOL_WAIT_RETRY_REASON } from "../../modules/run-dispatch/index.js";
-import { agentProviderLimitCooldown } from "../native-runtime/native-startup-retry.js";
+import { agentProviderLimitCooldown, aiCredentialChangedAt } from "../native-runtime/native-startup-retry.js";
 import { parseObject } from "../../adapters/utils.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
@@ -46,9 +46,9 @@ export function createProviderLimitWait(db: Db, deps: ProviderLimitWaitDependenc
     if (run.invocationSource === "on_demand" && run.triggerDetail === "manual") return false;
     if (parseObject(parseObject(agent.runtimeConfig).aiConnection).mode === "router") return false;
     const now = new Date();
-    const cooldown = await agentProviderLimitCooldown(db, {
-      companyId: run.companyId, agentId: run.agentId, runId: run.id, now,
-    }).catch((err: unknown) => {
+    const cooldown = await aiCredentialChangedAt(db, run.companyId).then((credentialChangedAt) => agentProviderLimitCooldown(db, {
+      companyId: run.companyId, agentId: run.agentId, runId: run.id, now, credentialChangedAt,
+    })).catch((err: unknown) => {
       // Missing evidence must not stop work; the provider still reports its own limit.
       logger.warn({ err, runId: run.id }, "provider limit evidence unavailable before dispatch");
       return null;

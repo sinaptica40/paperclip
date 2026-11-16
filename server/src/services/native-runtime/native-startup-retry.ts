@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { and, desc, eq, gte, inArray, ne, or, sql } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { connectionGrants, heartbeatRuns, type Db } from "@paperclipai/db";
 import { readProviderFailure, type ProviderFailure } from "@paperclipai/shared";
 import { logger } from "../../middleware/logger.js";
 import { infrastructureRetryDelayMs, PROVIDER_LIMIT_DEFAULT_COOLDOWN_MS } from "../system-recovery-state.js";
@@ -27,6 +27,22 @@ function limitEvidence(failure: ProviderFailure | null, observedAt: Date, source
     : { resetAt: observedAt.getTime() + PROVIDER_LIMIT_DEFAULT_COOLDOWN_MS, resetReported: false, category: failure.category, sourceRunId };
 }
 
+/**
+ * The latest time an AI credential in this company was signed in again. A
+ * reconnect rewrites the grant, so its update time marks the change.
+ */
+export async function aiCredentialChangedAt(db: Db, companyId: string): Promise<Date | null> {
+  const [row] = await db
+    .select({ changedAt: sql<Date | null>`max(${connectionGrants.updatedAt})`.mapWith(connectionGrants.updatedAt) })
+    .from(connectionGrants)
+    .where(and(
+      eq(connectionGrants.companyId, companyId),
+      eq(connectionGrants.status, "active"),
+      sql`${connectionGrants.credentialSecretRefs} @> '[{"configPath":"ai.credential"}]'::jsonb`,
+    ));
+  return row?.changedAt ?? null;
+}
+
 export type AgentProviderLimitCooldown = {
   /** When the agent's provider allowance is expected to return. */
   resetAt: Date;
@@ -48,8 +64,14 @@ export async function agentProviderLimitCooldown(db: Db, input: {
   runId?: string;
   failure?: ProviderFailure | null;
   now: Date;
+  /**
+   * When an AI credential was last signed in again. A limit seen before that
+   * may belong to the previous account, so it no longer holds work.
+   */
+  credentialChangedAt?: Date | null;
 }): Promise<AgentProviderLimitCooldown | null> {
   const now = input.now.getTime();
+  const changedAt = input.credentialChangedAt?.getTime() ?? null;
   let latest = limitEvidence(input.failure ?? null, input.now, input.runId ?? null);
   const rows = await db
     .select({
@@ -77,6 +99,7 @@ export async function agentProviderLimitCooldown(db: Db, input: {
   for (const row of rows) {
     // The provider accepted work after this point, so its allowance was restored.
     if (row.status === "succeeded") break;
+    if (changedAt !== null && row.observedAt.getTime() < changedAt) continue;
     let recorded = limitEvidence(readProviderFailure(row.providerFailure), row.observedAt, row.id);
     if (recorded === null && PROVIDER_LIMIT_ERROR_CODES.includes(row.errorCode ?? "")) {
       const reset = row.retryNotBefore ? Date.parse(row.retryNotBefore) : Number.NaN;

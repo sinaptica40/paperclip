@@ -10,6 +10,9 @@ import {
   agents,
   companies,
   completionContracts,
+  connectionGrants,
+  toolApplications,
+  toolConnections,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -40,7 +43,7 @@ import { loadNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
 import { environmentRunnerIngressErrorData, JsonRpcCallError, PluginEnvironmentRunnerIngressError } from "@paperclipai/plugin-sdk";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
-import { agentProviderLimitCooldown } from "./native-startup-retry.js";
+import { agentProviderLimitCooldown, aiCredentialChangedAt } from "./native-startup-retry.js";
 import { resolveLocalRuntimeApiUrl, runtimeApiInternals } from "../../runtime-api.js";
 
 type SessionOpenStatus = "failed" | "rejected" | "indeterminate";
@@ -1022,6 +1025,56 @@ describe("native provider startup retry", () => {
     expect(state.coordinator.failureDetail).toMatchObject({ providerCooldownAt: expected.toISOString() });
     expect(await agentProviderLimitCooldown(db, { companyId, agentId, now: new Date() }))
       .toMatchObject({ resetAt: expected, resetReported: true });
+  });
+
+  it("ignores a limit recorded before the AI credential was replaced", async () => {
+    const agentId = await createAgent();
+    const limitedAt = new Date(Date.now() - 5 * 60_000);
+    await recordPriorRun(agentId, {
+      status: "failed",
+      startedAt: new Date(limitedAt.getTime() - 60_000),
+      finishedAt: limitedAt,
+      errorCode: "native_provider_usage_limit",
+      resultJson: {
+        providerFailure: limitFailure({
+          category: "quota_exhausted",
+          retryAt: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
+          retryability: "requires_action",
+        }),
+      },
+    });
+    const now = new Date();
+    expect(await agentProviderLimitCooldown(db, { companyId, agentId, now })).not.toBeNull();
+    // The account was signed in again after the limit, so the limit may belong to the old account.
+    expect(await agentProviderLimitCooldown(db, {
+      companyId, agentId, now, credentialChangedAt: new Date(limitedAt.getTime() + 60_000),
+    })).toBeNull();
+    // A credential change before the limit says nothing about the new limit.
+    expect(await agentProviderLimitCooldown(db, {
+      companyId, agentId, now, credentialChangedAt: new Date(limitedAt.getTime() - 60_000),
+    })).not.toBeNull();
+  });
+
+  it("dates an AI credential change from active grants that hold an AI credential", async () => {
+    const empty = randomUUID();
+    await db.insert(companies).values({ id: empty, name: "No credential", issuePrefix: "NCR" });
+    expect(await aiCredentialChangedAt(db, empty)).toBeNull();
+    const [application] = await db.insert(toolApplications).values({ companyId: empty, name: "AI fixture", type: "rest_api" }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: empty, applicationId: application.id, name: "Saved AI login", uid: randomUUID(),
+      connectionPurpose: "ai", transport: "runtime_auth", status: "active", enabled: true,
+    }).returning();
+    const updatedAt = new Date(Date.now() - 60_000);
+    await db.insert(connectionGrants).values({
+      companyId: empty, connectionId: connection.id, kind: "organization",
+      credentialSecretRefs: [{ secretId: randomUUID(), configPath: "ai.credential", required: true, versionSelector: "latest" }],
+      updatedAt,
+    });
+    // A grant without an AI credential does not count.
+    await db.insert(connectionGrants).values({
+      companyId: empty, connectionId: connection.id, kind: "user", subjectUserId: "someone", credentialSecretRefs: [],
+    });
+    expect((await aiCredentialChangedAt(db, empty))?.getTime()).toBe(updatedAt.getTime());
   });
 
   it("holds a startup retry for at most one day before trying again", async () => {
